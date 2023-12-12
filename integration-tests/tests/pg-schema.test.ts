@@ -3,13 +3,14 @@ import 'dotenv/config';
 import type { TestFn } from 'ava';
 import anyTest from 'ava';
 import Docker from 'dockerode';
-import { asc, eq, Name, placeholder, sql } from 'drizzle-orm';
+import { and, asc, eq, Name, placeholder, sql } from 'drizzle-orm';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import {
 	alias,
 	boolean,
 	char,
+	foreignKey,
 	getMaterializedViewConfig,
 	getViewConfig,
 	integer,
@@ -17,6 +18,7 @@ import {
 	pgSchema,
 	pgTable,
 	pgTableCreator,
+	primaryKey,
 	serial,
 	text,
 	timestamp,
@@ -56,6 +58,28 @@ const publicUsersTable = pgTable('users', {
 	jsonb: jsonb('jsonb').$type<string[]>(),
 	createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+const peopleTable = pgTable("people", {
+	firstName: text("first_name"),
+	lastName: text("last_name"),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.firstName, table.lastName] }),
+}));
+
+const homesTable = pgTable("homes", {
+	firstName: text("first_name"),
+	lastName: text("last_name"),
+	address: text("address"),
+}, (table) => ({
+	pk: primaryKey({ columns: [table.firstName, table.lastName] }),
+	fk: foreignKey({
+		columns: [table.firstName, table.lastName],
+		foreignColumns: [peopleTable.firstName, peopleTable.lastName]
+	}, {
+		onDelete: "cascade",
+		onUpdate: "cascade",
+	})
+}));
 
 interface Context {
 	docker: Docker;
@@ -971,3 +995,80 @@ test.serial('materialized view', async (t) => {
 
 	await db.execute(sql`drop materialized view ${newYorkers1}`);
 });
+
+test.serial("multi-column foreign key cascade", async (t) => {
+	const ctx = t.context;
+	await ctx.db.execute(
+		sql`
+			CREATE TABLE people (
+				first_name text,
+				last_name text,
+				PRIMARY KEY (first_name, last_name)
+			);
+
+		`
+	);
+	await ctx.db.execute(
+		sql`
+			CREATE TABLE homes (
+				first_name text,
+				last_name text,
+				address text,
+				PRIMARY KEY (first_name, last_name),
+				FOREIGN KEY (first_name, last_name) REFERENCES people (first_name, last_name) ON DELETE CASCADE ON UPDATE CASCADE
+			);
+		`
+	);
+
+	const { db } = ctx;
+
+	let personA = { firstName: "Andrew", lastName: "Sherman" };
+	let personB = { firstName: "Andrew", lastName: "NotSherman" };
+	let people = [personA, personB];
+
+	await db.insert(peopleTable).values(people);
+
+	let homeA = { ...personA, address: "Address A" };
+	let homes = [homeA];
+
+	await db.insert(homesTable).values(homes);
+
+	// Test insert successful
+	{
+		const resultPeople = await db.select().from(peopleTable);
+		t.deepEqual(resultPeople, people, "Insert not successful");
+
+		const resultHomes = await db.select().from(homesTable);
+		t.deepEqual(resultHomes, homes, "Insert not successful");
+	}
+
+	// Test delete unrelated (nothing should happen)
+	{
+		await db.delete(peopleTable).where(and(eq(peopleTable.firstName, personB.firstName), eq(peopleTable.lastName, personB.lastName)));
+		people = people.slice(0, people.length - 1);
+		const resultDelete = await db.select().from(peopleTable); 
+		t.deepEqual(resultDelete, people, "Did not remove person correctly")
+
+		const resultHomes = await db.select().from(homesTable);
+		t.deepEqual(resultHomes, homes, "Wrongly deleted one of the homes");
+	}	
+
+	// Update cascade
+	{
+		const personC = { firstName: "Person", lastName: "C" };
+		await db.update(peopleTable).set(personC).where(and(eq(peopleTable.firstName, personA.firstName), eq(peopleTable.lastName, personA.lastName)));
+		personA = personC;
+		homeA = { ...homeA, ...personA };
+		const result = await db.select().from(homesTable).where(and(eq(homesTable.firstName, personA.firstName), eq(homesTable.lastName, personA.lastName)));
+		t.deepEqual(result, [homeA], "Did not get correct home for updated person");
+	}
+
+	// Deletes cascade
+	{
+		await db.delete(peopleTable).where(and(eq(peopleTable.firstName, personA.firstName), eq(peopleTable.lastName, personA.lastName)));
+		people = people.slice(0, people.length - 1);
+		homes = homes.slice(0, homes.length - 1);
+		const result = await db.select().from(homesTable);
+		t.deepEqual(result, homes, "Did not delete home");
+	}
+})
